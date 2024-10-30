@@ -5,7 +5,7 @@
 
 
 # DHeLlam Overview
-`DHeLlam` enables double-strands interleaving scheduling to accelerate LLM training. You can convert an LLM, such as Llama and GPT using **DSLLM** which is also derived from *torch.nn.module*, allowing it to work with minimal code modifications.
+`DHeLlam` enables double-strands scheduling to accelerate distributed large language model(LLM) training. You can leverage `DHeLlam` across various mainstream parallelism methods in distributed LLM training, including data parallelism, pipeline parallelism, tensor parallelism, sequence parallelism, context parallelism, and expert parallelism. Specifically, in scenarios utilizing intra-layer parallelism (including tensor, sequence, context, and expert parallelism), DHeLlam effectively improves overall training throughput by hiding the communication overhead introduced by these parallelisms.
 
 
 The code of `DHeLlam` mainly includes 4 submodules:
