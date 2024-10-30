@@ -76,8 +76,8 @@ Then the dataset which can be handled by **Megatron-LM** is collected in `data/l
 
 
 # Installation
-**Requirements**
 
+### Requirements
 * torch>=2.3.0
 * transformer-engine>=1.4.0
 * sentencepiece
@@ -87,13 +87,14 @@ We strongly recommand using *docker* to install `DHeLlam` and run examples. You 
 
 To support suppot Flash-Attention, the compute capability of NVIDIA GPU must be larger than 8.0, and you can access the following url to check if your device could satisfy the requirements: [NVIDIA GPU Products](https://developer.nvidia.com/cuda-gpus)
 
-## Clone from github
+### Clone from github
 ```bash
+git clone https://github.com/DHeLlam-502/dhellam.git
 git submodule sync
 git submodule update --init --recursive
 ```
 
-## DHeLlam
+### DHeLlam
 ```sh
 pip install -e .
 ```
@@ -105,7 +106,7 @@ To reduce compilation time, you can can set the environment variable `MAX_JOBS`,
 ```sh
 MAX_JOBS=32 python setup.py install
 ```
-## Megatron
+### Megatron
 We develop `DHeLlam` atop `Megatron-LM-Corev0.5.0`. All modifications are collected in **megatron.patch** and you can apply it directly by *git apply*.
 ```sh
 cd 3rdparty/Megatron-LM
@@ -113,8 +114,7 @@ git checkout -b dhellam
 git apply ../../megatron.patch
 ```
 
-# Usage
-## 1-click demo!
+# Usage: 1-click demo!
 We provide an Llama3.1-70B model with 8 layers as a demo, to quickly present the workflow of `DHeLlam` and you can run it by executing `run.sh` in `script/`. 
 
 ```sh
