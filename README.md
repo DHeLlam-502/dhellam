@@ -51,13 +51,17 @@ The Overall directory tree of `DHeLlam` is listed as following:
 
 ## A40
 <div align="center">
- <img src="docs/task.3D.parallelism.GPT.Llama.svg" width="300px">
- <img src="docs/task.4D.parallelism.GPT.Llama.svg" width="300px">
+ <img src="docs/task.3D.parallelism.GPT.Llama.svg" width="600px">
+ 
+</div>
+
+<div align="center">
+ <img src="docs/task.4D.parallelism.GPT.Llama.svg" width="600px">
 </div>
 
 ## A800
 <div align="center">
- <img src="docs/task.A800.MoE.CP.svg" width="300px">
+ <img src="docs/task.A800.MoE.CP.svg" width="600px">
 </div>
 
 
