@@ -1,0 +1,13 @@
+build/
+*.egg-info
+*.so
+__pycache__
+dist/
+*.nsys-rep
+*.csv
+*.sqlite
+cof-gen/
+output/
+llama-data/
+*.json
+op_profile_num.txt

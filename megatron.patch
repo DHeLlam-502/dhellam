@@ -1,0 +1,1034 @@
+diff --git a/megatron/arguments.py b/megatron/arguments.py
+index d10b4f30..9c5bf87d 100644
+--- a/megatron/arguments.py
++++ b/megatron/arguments.py
+@@ -450,7 +450,7 @@ def core_transformer_config_from_args(args):
+     kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
+     kw_args['layernorm_zero_centered_gamma'] = args.apply_layernorm_1p
+     kw_args['layernorm_epsilon'] = args.norm_epsilon
+-    kw_args['deallocate_pipeline_outputs'] = True
++    kw_args['deallocate_pipeline_outputs'] = False
+     kw_args['pipeline_dtype'] = args.params_dtype
+     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm 
+     kw_args['num_moe_experts'] = args.num_experts
+@@ -1295,6 +1295,8 @@ def _add_data_args(parser):
+     group.add_argument('--reset-attention-mask', action='store_true',
+                        help='Reset self attention maske after '
+                        'end-of-document token.')
++    group.add_argument('--attention-mask-cuda-init', action='store_true',
++                       help='initialize in cuda device.')
+     group.add_argument('--eod-mask-loss', action='store_true',
+                        help='Mask loss for the end of document tokens.')
+ 
+diff --git a/megatron/core/datasets/gpt_dataset.py b/megatron/core/datasets/gpt_dataset.py
+index a5c40836..af91267d 100644
+--- a/megatron/core/datasets/gpt_dataset.py
++++ b/megatron/core/datasets/gpt_dataset.py
+@@ -9,7 +9,7 @@ from typing import Dict, Tuple
+ 
+ import numpy
+ import torch
+-
++from megatron import get_args
+ from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
+ from megatron.core.datasets.indexed_dataset import MMapIndexedDataset
+ from megatron.core.datasets.megatron_dataset import MegatronDataset, MockDataset
+@@ -600,12 +600,20 @@ def _get_ltor_masks_and_position_ids(
+ 
+         torch.Tensor : The position ID's of the token
+     """
++    args = get_args()
+     seq_length = data.numel()
+ 
+-    attention_mask = torch.tril(torch.ones((seq_length, seq_length), device=data.device)).unsqueeze(
+-        0
+-    )
+-
++    # attention_mask = torch.tril(torch.ones((seq_length, seq_length), device=data.device)).unsqueeze(
++    #         0
++    #     )
++    if args.attention_mask_cuda_init:
++        attention_mask = torch.tril(torch.ones((1, 1), device=data.device)).unsqueeze(
++            0
++        )
++    else:
++        attention_mask = torch.tril(torch.ones((seq_length, seq_length), device=data.device)).unsqueeze(
++            0
++        )
+     # Loss mask.
+     loss_mask = torch.ones(seq_length, dtype=torch.float, device=data.device)
+     if eod_mask_loss:
+@@ -629,7 +637,8 @@ def _get_ltor_masks_and_position_ids(
+         for j in range(eod_index.numel()):
+             i = eod_index[j]
+             # Mask attention loss.
+-            if reset_attention_mask:
++            if reset_attention_mask and not args.attention_mask_cuda_init:
++            # if reset_attention_mask:
+                 attention_mask[0, (i + 1) :, : (i + 1)] = 0
+             # Reset positions.
+             if reset_position_ids:
+diff --git a/megatron/core/pipeline_parallel/p2p_communication.py b/megatron/core/pipeline_parallel/p2p_communication.py
+index 29ee34df..44f702d8 100644
+--- a/megatron/core/pipeline_parallel/p2p_communication.py
++++ b/megatron/core/pipeline_parallel/p2p_communication.py
+@@ -325,7 +325,23 @@ def _communicate(
+         p2p_func = _batched_p2p_ops
+     else:
+         p2p_func = _p2p_ops
+-
++    
++    
++    if config.timers is not None:
++        config.timers('pp-bubble', log_level=2).start()
++    barrier_reqs = p2p_func(
++        tensor_send_prev=torch.tensor([1],dtype=torch.float16, device="cuda") if tensor_send_prev is not None else None,
++        tensor_recv_prev=torch.tensor([1],dtype=torch.float16, device="cuda") if tensor_recv_prev is not None else None,
++        tensor_send_next=torch.tensor([1],dtype=torch.float16, device="cuda") if tensor_send_next is not None else None,
++        tensor_recv_next=torch.tensor([1],dtype=torch.float16, device="cuda") if tensor_recv_next is not None else None,
++        group=get_pipeline_model_parallel_group(),
++    )
++    if len(barrier_reqs) > 0:
++        for req in barrier_reqs:
++            req.wait()
++        torch.cuda.synchronize()
++    if config.timers is not None:
++        config.timers('pp-bubble').stop()
+     reqs = p2p_func(
+         tensor_send_prev=tensor_send_prev,
+         tensor_recv_prev=tensor_recv_prev,
+diff --git a/megatron/core/pipeline_parallel/schedules.py b/megatron/core/pipeline_parallel/schedules.py
+index 6dc4011f..88d6a82b 100644
+--- a/megatron/core/pipeline_parallel/schedules.py
++++ b/megatron/core/pipeline_parallel/schedules.py
+@@ -6,16 +6,17 @@ from typing import Callable, Iterator, List, Optional, Union
+ import torch
+ from torch.autograd.variable import Variable
+ 
++from megatron import get_args,get_num_microbatches
+ from megatron.core import parallel_state
+ from megatron.core.enums import ModelType
+ from megatron.core.pipeline_parallel import p2p_communication
+ from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
+ from megatron.core.utils import get_attr_wrapped_model, get_model_config, get_model_type
+ 
++from dhellam.common.global_variables import GLOBAL_VARIABLES
+ # Types
+ Shape = Union[List[int], torch.Size]
+ 
+-
+ def get_forward_backward_func():
+     """Retrieves the appropriate forward_backward function given the
+     configuration of parallel_state.
+@@ -195,6 +196,7 @@ def forward_step(
+                 data_iterator, model, checkpoint_activations_microbatch
+             )
+ 
++
+     if parallel_state.is_pipeline_last_stage():
+         if not collect_non_loss_data:
+             output_tensor = loss_func(output_tensor)
+@@ -265,13 +267,26 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
+         output_tensor_grad = [output_tensor_grad]
+ 
+     # Backward pass.
+-    if output_tensor_grad[0] is None and config.grad_scale_func is not None:
+-        output_tensor[0] = config.grad_scale_func(output_tensor[0])
+-
+-    if config.deallocate_pipeline_outputs:
+-        custom_backward(output_tensor[0], output_tensor_grad[0])
++    if not get_args().dhellam or parallel_state.get_pipeline_model_parallel_world_size()< 2:
++        if output_tensor_grad[0] is None and config.grad_scale_func is not None:
++            output_tensor[0] = config.grad_scale_func(output_tensor[0])
++            '''
++            if torch.distributed.get_rank() == 0:
++                print("Loss after scale: ",output_tensor[0])
++            '''
++
++        if config.deallocate_pipeline_outputs:
++            custom_backward(output_tensor[0], output_tensor_grad[0])
++        else:
++            torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
+     else:
+-        torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
++        GLOBAL_VARIABLES["inputs"] = output_tensor_grad
++        #* Fake gradient for placeholder
++        if config.deallocate_pipeline_outputs:
++            custom_backward(output_tensor[0], output_tensor[0])
++        else:
++            torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor[0])   
++
+ 
+     # Collect the grad of the input_tensor.
+     input_tensor_grad = [None]
+@@ -295,9 +310,13 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
+     if unwrap_input_tensor_grad:
+         input_tensor_grad = input_tensor_grad[0]
+ 
++    if get_args().dhellam and parallel_state.get_pipeline_model_parallel_world_size()>1:
++        input_tensor_grad = GLOBAL_VARIABLES["inputs"]
++
+     if config.timers is not None:
+         config.timers('backward-compute').stop()
+ 
++
+     return input_tensor_grad
+ 
+ 
+@@ -352,7 +371,7 @@ def forward_backward_no_pipelining(
+     forward_data_store = []
+     input_tensor, output_tensor_grad = None, None
+     with no_sync_func():
+-        for i in range(num_microbatches - 1):
++        for i in range(num_microbatches if config.dhellam else num_microbatches-1):
+             output_tensor = forward_step(
+                 forward_step_func,
+                 data_iterator,
+@@ -371,7 +390,7 @@ def forward_backward_no_pipelining(
+     # synchronize gradients).
+     output_tensor = forward_step(
+         forward_step_func,
+-        data_iterator,
++        'skip' if config.dhellam else data_iterator,
+         model,
+         num_microbatches,
+         input_tensor,
+@@ -1014,11 +1033,64 @@ def get_tensor_shapes(
+         else:
+             tensor_shapes.append((decoder_seq_length, micro_batch_size, config.hidden_size))
+             tensor_shapes.append((seq_length, micro_batch_size, config.hidden_size))
+-    else:
++    else: #* (s//sp,b,h)
+         tensor_shapes.append((seq_length, micro_batch_size, config.hidden_size))
++
+     return tensor_shapes
+ 
+ 
++def get_tensor_shapes_dhellam(
++    *,
++    rank: int,
++    model_type: ModelType,
++    seq_length: int,
++    micro_batch_size: int,
++    decoder_seq_length: int,
++    config,
++    warmup : int = 0,
++):
++    # Determine right tensor sizes (based on position of rank with respect to split
++    # rank) and model size.
++    # Send two tensors if model is T5 and rank is in decoder stage:
++    #     first tensor is decoder (pre-transpose),
++    #     second tensor is encoder (post-transpose).
++    # If model is T5 and rank is at the boundary:
++    #     send one tensor (post-transpose from encoder).
++    # Otherwise, send one tensor (pre-transpose).
++    tensor_shapes = []
++
++    seq_length = seq_length // parallel_state.get_context_parallel_world_size()
++    if model_type == ModelType.encoder_and_decoder:
++        decoder_seq_length = decoder_seq_length // parallel_state.get_context_parallel_world_size()
++
++    if config.sequence_parallel:
++        seq_length = seq_length // parallel_state.get_tensor_model_parallel_world_size()
++        if model_type == ModelType.encoder_and_decoder:
++            decoder_seq_length = (
++                decoder_seq_length // parallel_state.get_tensor_model_parallel_world_size()
++            )
++
++    if model_type == ModelType.encoder_and_decoder:
++        if parallel_state.is_pipeline_stage_before_split(rank):
++            tensor_shapes.append((seq_length, micro_batch_size, config.hidden_size))
++        else:
++            tensor_shapes.append((decoder_seq_length, micro_batch_size, config.hidden_size))
++            tensor_shapes.append((seq_length, micro_batch_size, config.hidden_size))
++    else: #* (s//sp,b,h)
++        if warmup ==0:
++            tensor_shapes.append((micro_batch_size, seq_length,config.hidden_size))
++            tensor_shapes.append((micro_batch_size,seq_length,config.hidden_size))
++        elif warmup == 1:
++            tensor_shapes.append(None)
++            tensor_shapes.append((micro_batch_size, seq_length,config.hidden_size))
++        elif warmup == 2:
++            tensor_shapes.append((micro_batch_size, seq_length,config.hidden_size))
++            tensor_shapes.append(None)
++
++    return tensor_shapes
++
++
++
+ def recv_forward(tensor_shapes, config):
+     input_tensors = []
+     for tensor_shape in tensor_shapes:
+@@ -1056,7 +1128,6 @@ def send_backward(input_tensor_grads, tensor_shapes, config):
+             continue
+         p2p_communication.send_backward(input_tensor_grad, config)
+ 
+-
+ def send_forward_recv_backward(output_tensors, tensor_shapes, config):
+     if not isinstance(output_tensors, list):
+         output_tensors = [output_tensors]
+@@ -1071,6 +1142,83 @@ def send_forward_recv_backward(output_tensors, tensor_shapes, config):
+         output_tensor_grads.append(output_tensor_grad)
+     return output_tensor_grads
+ 
++def send_forward_recv_backward_dhellam(output_tensors, tensor_shapes, config):
++    if not isinstance(output_tensors, list):
++        output_tensors = [output_tensors]
++    output_tensor_grads = output_tensors
++    if not parallel_state.is_pipeline_last_stage():
++        output_tensor_grads = []
++        if not get_num_microbatches() < parallel_state.get_pipeline_model_parallel_world_size():
++            for (output_tensor, tensor_shape) in zip(output_tensors, tensor_shapes):
++                if tensor_shape is None:
++                    output_tensor_grads.append(None)
++                    if output_tensor is not None:
++                        p2p_communication.send_forward(output_tensor,config)
++                    continue
++                else:
++                    if output_tensor is None:
++                        output_tensor_grads.append(p2p_communication.recv_backward(tensor_shape, config))
++                        continue          
++                output_tensor_grad = p2p_communication.send_forward_recv_backward(
++                    output_tensor, tensor_shape, config
++                )
++                output_tensor_grads.append(output_tensor_grad)
++        else:
++            for output_tensor in output_tensors:
++                if output_tensor is not None:
++                    p2p_communication.send_forward(output_tensor,config)           
++            for tensor_shape in tensor_shapes:
++                if tensor_shape is not None:
++                    output_tensor_grads.append(p2p_communication.recv_backward(tensor_shape, config)) 
++                else:
++                    output_tensor_grads.append(None)
++
++    return output_tensor_grads
++
++
++def send_backward_recv_forward_dhellam(input_tensor_grads, tensor_shapes, config):
++    if not isinstance(input_tensor_grads, list):
++        input_tensor_grads = [input_tensor_grads]
++    input_tensors = input_tensor_grads
++    if not parallel_state.is_pipeline_first_stage():
++        input_tensors = []
++        if not get_num_microbatches() < parallel_state.get_pipeline_model_parallel_world_size():
++            for (input_tensor_grad, tensor_shape) in zip(input_tensor_grads, tensor_shapes):
++                if tensor_shape is None:
++                    input_tensors.append(None)
++                    if input_tensor_grad is not None:
++                        p2p_communication.send_backward(input_tensor_grad,config)
++                    continue
++                else:
++                    if input_tensor_grad is None:
++                        input_tensors.append(p2p_communication.recv_forward(tensor_shape, config))
++                        continue
++                input_tensor = p2p_communication.send_backward_recv_forward(
++                    input_tensor_grad, tensor_shape, config
++                )
++                input_tensors.append(input_tensor)
++        else:
++            if get_num_microbatches() - parallel_state.get_pipeline_model_parallel_rank() -1 >=0 :
++                for tensor_shape in tensor_shapes:
++                    if tensor_shape is not None:
++                        input_tensors.append(p2p_communication.recv_forward(tensor_shape, config))    
++                    else:
++                        input_tensors.append(None)
++                for input_tensor_grad in input_tensor_grads:
++                    if input_tensor_grad is not None:
++                        p2p_communication.send_backward(input_tensor_grad,config) 
++            else:
++                for input_tensor_grad in input_tensor_grads:
++                    if input_tensor_grad is not None:
++                        p2p_communication.send_backward(input_tensor_grad,config)           
++                for tensor_shape in tensor_shapes:
++                    if tensor_shape is not None:
++                        input_tensors.append(p2p_communication.recv_forward(tensor_shape, config)) 
++                    else:
++                        input_tensors.append(None)
++    
++    return input_tensors
++
+ 
+ def send_backward_recv_forward(input_tensor_grads, tensor_shapes, config):
+     if not isinstance(input_tensor_grads, list):
+@@ -1105,6 +1253,7 @@ def forward_backward_pipelining_without_interleaving(
+ 
+     Returns dictionary with losses if the last stage, empty dict otherwise."""
+ 
++    args = get_args()
+     if isinstance(model, list):
+         assert (
+             len(model) == 1
+@@ -1147,14 +1296,24 @@ def forward_backward_pipelining_without_interleaving(
+ 
+     disable_grad_sync()
+ 
++    if args.dhellam:
++        original_num_mb = num_microbatches
++        num_microbatches += parallel_state.get_pipeline_model_parallel_world_size()
++
+     # Compute number of warmup microbatches.
+     num_warmup_microbatches = (
+         parallel_state.get_pipeline_model_parallel_world_size()
+         - parallel_state.get_pipeline_model_parallel_rank()
+         - 1
+     )
+-    num_warmup_microbatches = min(num_warmup_microbatches, num_microbatches)
+-    num_microbatches_remaining = num_microbatches - num_warmup_microbatches
++    num_warmup_microbatches = min(num_warmup_microbatches, num_microbatches)  
++    num_microbatches_remaining =  num_microbatches - num_warmup_microbatches
++
++    if args.dhellam:
++        if original_num_mb < parallel_state.get_pipeline_model_parallel_world_size():
++            num_warmup_microbatches = max((original_num_mb - parallel_state.get_pipeline_model_parallel_rank() -1),0)
++            num_microbatches_remaining = original_num_mb*2 - num_warmup_microbatches
++
+ 
+     # Checkpoint the activations of partial Transformer layers in a number of micro-batches
+     # within the maximum outstanding micro-batch backpropagations.
+@@ -1171,26 +1330,84 @@ def forward_backward_pipelining_without_interleaving(
+     model_type = get_model_type(model)
+ 
+     rank = parallel_state.get_pipeline_model_parallel_rank()
+-    recv_tensor_shapes = get_tensor_shapes(
+-        rank=rank - 1,
+-        model_type=model_type,
+-        seq_length=seq_length,
+-        micro_batch_size=micro_batch_size,
+-        decoder_seq_length=decoder_seq_length,
+-        config=config,
+-    )
+-    send_tensor_shapes = get_tensor_shapes(
+-        rank=rank,
+-        model_type=model_type,
+-        seq_length=seq_length,
+-        micro_batch_size=micro_batch_size,
+-        decoder_seq_length=decoder_seq_length,
+-        config=config,
+-    )
++    if not args.dhellam:
++        recv_tensor_shapes = get_tensor_shapes( #* obtain recv tensor info
++            rank=rank - 1,
++            model_type=model_type,
++            seq_length=seq_length,
++            micro_batch_size=micro_batch_size,
++            decoder_seq_length=decoder_seq_length,
++            config=config,
++        )
++        send_tensor_shapes = get_tensor_shapes( #* obtain send tensor info
++            rank=rank,
++            model_type=model_type,
++            seq_length=seq_length,
++            micro_batch_size=micro_batch_size,
++            decoder_seq_length=decoder_seq_length,
++            config=config,
++        )
++    else:
++        recv_tensor_shapes_overlap = get_tensor_shapes_dhellam( #* obtain recv tensor info in DCCLLM
++            rank=rank - 1,
++            model_type=model_type,
++            seq_length=seq_length,
++            micro_batch_size=micro_batch_size,
++            decoder_seq_length=decoder_seq_length,
++            config=config,
++            warmup=0
++        )
++        recv_tensor_shapes_forward = get_tensor_shapes_dhellam( #* obtain recv tensor info in DCCLLM
++            rank=rank - 1,
++            model_type=model_type,
++            seq_length=seq_length,
++            micro_batch_size=micro_batch_size,
++            decoder_seq_length=decoder_seq_length,
++            config=config,
++            warmup=1
++        )
++        recv_tensor_shapes_backward = get_tensor_shapes_dhellam( #* obtain recv tensor info in DCCLLM
++            rank=rank - 1,
++            model_type=model_type,
++            seq_length=seq_length,
++            micro_batch_size=micro_batch_size,
++            decoder_seq_length=decoder_seq_length,
++            config=config,
++            warmup=2
++        )
++        send_tensor_shapes_overlap = get_tensor_shapes_dhellam( #* obtain send tensor info in dhellam
++            rank=rank,
++            model_type=model_type,
++            seq_length=seq_length,
++            micro_batch_size=micro_batch_size,
++            decoder_seq_length=decoder_seq_length,
++            config=config,
++            warmup=0
++        )
++        send_tensor_shapes_forward = get_tensor_shapes_dhellam( #* obtain send tensor info in dhellam
++            rank=rank,
++            model_type=model_type,
++            seq_length=seq_length,
++            micro_batch_size=micro_batch_size,
++            decoder_seq_length=decoder_seq_length,
++            config=config,
++            warmup=1
++        )
++        send_tensor_shapes_backward = get_tensor_shapes_dhellam( #* obtain send tensor info in dhellam
++            rank=rank,
++            model_type=model_type,
++            seq_length=seq_length,
++            micro_batch_size=micro_batch_size,
++            decoder_seq_length=decoder_seq_length,
++            config=config,
++            warmup=2
++        )
+ 
+     # Input, output tensors only need to be saved when doing backward passes
+     input_tensors = None
+     output_tensors = None
++    num_batch_count = 0    #* count for mb number in dhellam
++    num_batch_count_bwd = 0
+     if not forward_only:
+         input_tensors = []
+         output_tensors = []
+@@ -1206,12 +1423,17 @@ def forward_backward_pipelining_without_interleaving(
+             )
+         else:
+             checkpoint_activations_microbatch = None
+-
+-        input_tensor = recv_forward(recv_tensor_shapes, config)
++        if args.dhellam: 
++            input_tensor = recv_forward(recv_tensor_shapes_forward, config)
++        else:
++            input_tensor = recv_forward(recv_tensor_shapes, config)
++        if args.dhellam:
++            if num_batch_count >= original_num_mb:
++                data_iterator = "skip"
+         output_tensor = forward_step(
+             forward_step_func,
+             data_iterator,
+-            model,
++            model, 
+             num_microbatches,
+             input_tensor,
+             forward_data_store,
+@@ -1220,20 +1442,37 @@ def forward_backward_pipelining_without_interleaving(
+             checkpoint_activations_microbatch,
+             check_first_val_step(first_val_step, forward_only, i == 0),
+         )
+-        send_forward(output_tensor, send_tensor_shapes, config)
++        if args.dhellam: 
++            output_tensor_dhellam = GLOBAL_VARIABLES["inputs"]
++            send_forward(output_tensor_dhellam, send_tensor_shapes_forward, config)
++            GLOBAL_VARIABLES["inputs"] = [None,None]
++        else:
++            send_forward(output_tensor, send_tensor_shapes, config)
+ 
+-        if not forward_only:
+-            input_tensors.append(input_tensor)
++        if not forward_only:  #TODO mod for dhellam
++            if args.dhellam:
++                input_tensors.append([None])  #*  Fake input tensor storage for dhellam
++            else:
++                input_tensors.append(input_tensor)  #* maintain activations
+             output_tensors.append(output_tensor)
+             deallocate_output_tensor(output_tensor[0], config.deallocate_pipeline_outputs)
+ 
++        num_batch_count+= 1
++
++
+     # Before running 1F1B, need to receive first forward tensor.
+     # If all microbatches are run in warmup / cooldown phase, then no need to
+     # receive this tensor here.
+     if num_microbatches_remaining > 0:
+-        input_tensor = recv_forward(recv_tensor_shapes, config)
++        if args.dhellam:
++            input_tensor = recv_forward(recv_tensor_shapes_forward, config)
++        else:
++            input_tensor = recv_forward(recv_tensor_shapes, config)
+ 
+-    # Run 1F1B in steady state.
++    #* warmup code all clear
++
++
++    #! Run 1F1B in steady state.):
+     for i in range(num_microbatches_remaining):
+         last_iteration = i == (num_microbatches_remaining - 1)
+ 
+@@ -1245,6 +1484,9 @@ def forward_backward_pipelining_without_interleaving(
+         else:
+             checkpoint_activations_microbatch = None
+ 
++        if args.dhellam:
++            if num_batch_count >= original_num_mb:
++                data_iterator = "skip"
+         output_tensor = forward_step(
+             forward_step_func,
+             data_iterator,
+@@ -1261,18 +1503,51 @@ def forward_backward_pipelining_without_interleaving(
+         )
+ 
+         if forward_only:
+-            send_forward(output_tensor, send_tensor_shapes, config)
+-
+-            if not last_iteration:
++            if args.dhellam:
++                if num_batch_count < parallel_state.get_pipeline_model_parallel_world_size():
++                    send_forward(output_tensor, send_tensor_shapes_forward, config)
++                else:
++                    send_forward(output_tensor, send_tensor_shapes_overlap, config)
++            else:
++                send_forward(output_tensor, send_tensor_shapes, config)
++            if not last_iteration:  
+                 input_tensor = recv_forward(recv_tensor_shapes, config)
+ 
++
+         else:
+-            output_tensor_grad = send_forward_recv_backward(
+-                output_tensor, send_tensor_shapes, config
+-            )
++            if args.dhellam:
++                output_tensor_dhellam = GLOBAL_VARIABLES["inputs"]
++                if not original_num_mb < parallel_state.get_pipeline_model_parallel_world_size():
++                    if num_batch_count_bwd < parallel_state.get_pipeline_model_parallel_world_size() :
++                        output_tensor_grad = send_forward_recv_backward_dhellam(
++                        output_tensor_dhellam, send_tensor_shapes_forward, config
++                    )
++                    elif  num_batch_count_bwd < original_num_mb :
++                        output_tensor_grad = send_forward_recv_backward_dhellam(
++                        output_tensor_dhellam, send_tensor_shapes_overlap, config
++                    )
++                    else :
++                        output_tensor_grad = send_forward_recv_backward_dhellam(
++                        output_tensor_dhellam, send_tensor_shapes_backward, config
++                    )    
++                else:
++                    if num_batch_count_bwd < original_num_mb:
++                        output_tensor_grad = send_forward_recv_backward_dhellam(
++                        output_tensor_dhellam, send_tensor_shapes_forward, config)
++                    else:
++                        output_tensor_grad = send_forward_recv_backward_dhellam(
++                        output_tensor_dhellam, send_tensor_shapes_backward, config
++                    )   
++            else:
++                output_tensor_grad = send_forward_recv_backward(
++                    output_tensor, send_tensor_shapes, config
++                )
+ 
+             # Add input_tensor and output_tensor to end of list.
+-            input_tensors.append(input_tensor)
++            if args.dhellam:
++                input_tensors.append([None])
++            else:
++                input_tensors.append(input_tensor)
+             output_tensors.append(output_tensor)
+             deallocate_output_tensor(output_tensor[0], config.deallocate_pipeline_outputs)
+ 
+@@ -1287,17 +1562,47 @@ def forward_backward_pipelining_without_interleaving(
+                 if config.grad_sync_func is None or rank == 0:
+                     enable_grad_sync()
+ 
+-            input_tensor_grad = backward_step(
++            input_tensor_grad = backward_step( 
+                 input_tensor, output_tensor, output_tensor_grad, model_type, config
+             )
+ 
+             if last_iteration:
+                 input_tensor = None
+-                send_backward(input_tensor_grad, recv_tensor_shapes, config)
++                if args.dhellam:
++                    send_backward(input_tensor_grad, recv_tensor_shapes_backward, config)
++                else:
++                    send_backward(input_tensor_grad, recv_tensor_shapes, config)
+             else:
+-                input_tensor = send_backward_recv_forward(
+-                    input_tensor_grad, recv_tensor_shapes, config
+-                )
++                if args.dhellam:
++                    if not original_num_mb< parallel_state.get_pipeline_model_parallel_world_size():
++                        if num_batch_count < parallel_state.get_pipeline_model_parallel_world_size()-1 :
++                            input_tensor = send_backward_recv_forward_dhellam(
++                                input_tensor_grad, recv_tensor_shapes_forward, config
++                            )
++                        elif num_batch_count < original_num_mb-1 :
++                            input_tensor = send_backward_recv_forward_dhellam(
++                                input_tensor_grad, recv_tensor_shapes_overlap, config
++                            )
++                        else:
++                            input_tensor = send_backward_recv_forward_dhellam(
++                                input_tensor_grad, recv_tensor_shapes_backward, config
++                            )
++                    else:
++                        if num_batch_count < original_num_mb -1  :
++                            input_tensor = send_backward_recv_forward_dhellam(
++                                input_tensor_grad, recv_tensor_shapes_forward, config
++                            )
++                        else:
++                            input_tensor = send_backward_recv_forward_dhellam(
++                                input_tensor_grad, recv_tensor_shapes_backward, config
++                            )                            
++
++                else:
++                    input_tensor = send_backward_recv_forward(
++                        input_tensor_grad, recv_tensor_shapes, config
++                    )
++        num_batch_count+= 1
++        num_batch_count_bwd+=1
+ 
+     # Run cooldown backward passes.
+     if not forward_only:
+@@ -1315,23 +1620,34 @@ def forward_backward_pipelining_without_interleaving(
+             input_tensor = input_tensors.pop(0)
+             output_tensor = output_tensors.pop(0)
+ 
+-            output_tensor_grad = recv_backward(send_tensor_shapes, config)
++            if args.dhellam:
++                output_tensor_grad = recv_backward(send_tensor_shapes_backward, config)
++            else:
++                output_tensor_grad = recv_backward(send_tensor_shapes, config)
+ 
+             input_tensor_grad = backward_step(
+                 input_tensor, output_tensor, output_tensor_grad, model_type, config
+             )
+ 
+-            send_backward(input_tensor_grad, recv_tensor_shapes, config)
++            if args.dhellam:
++                send_backward(input_tensor_grad, recv_tensor_shapes_backward, config)
++            else:   
++                send_backward(input_tensor_grad, recv_tensor_shapes, config)
+ 
+         # Launch any remaining grad reductions.
+         if no_sync_context is not None:
+             enable_grad_sync()
+             if config.grad_sync_func is not None:
+                 config.grad_sync_func(model.parameters())
+-
++    if config.timers is not None:
++        config.timers('pp-bubble', log_level=2).start()
++        config.timers('backward-recv', log_level=2).start()
++    torch.distributed.barrier()
++    if config.timers is not None:
++        config.timers('backward-recv').stop()
++        config.timers('pp-bubble').stop()
+     if config.timers is not None:
+         config.timers('forward-backward').stop()
+-
+     if config.finalize_model_grads_func is not None and not forward_only:
+         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
+         # data parallelism, layernorm all-reduce for sequence parallelism, and
+diff --git a/megatron/core/tensor_parallel/layers.py b/megatron/core/tensor_parallel/layers.py
+index a73803a5..990eeffa 100644
+--- a/megatron/core/tensor_parallel/layers.py
++++ b/megatron/core/tensor_parallel/layers.py
+@@ -762,7 +762,6 @@ class ColumnParallelLinear(torch.nn.Module):
+             input_parallel = input_
+         else:
+             input_parallel = copy_to_tensor_model_parallel_region(input_)
+-
+         # Matrix multiply.
+         if not weight.requires_grad:
+             self._forward_impl = linear_with_frozen_weight
+diff --git a/megatron/core/timers.py b/megatron/core/timers.py
+index 672a79f5..674ad903 100644
+--- a/megatron/core/timers.py
++++ b/megatron/core/timers.py
+@@ -136,7 +136,6 @@ class Timer(TimerBase):
+             self.start(barrier=barrier)
+         return _elapsed
+ 
+-
+ class Timers:
+     """Class for a group of Timers.
+     """
+diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
+index cba3454a..2ed7f9ae 100644
+--- a/megatron/core/transformer/transformer_config.py
++++ b/megatron/core/transformer/transformer_config.py
+@@ -66,6 +66,8 @@ class TransformerConfig(ModelParallelConfig):
+             moe_input_jitter_eps (float): Add noise to the input tensor by applying jitter with a specified epsilon value.
+             moe_token_dropping (bool): This feature involves selectively dropping and padding tokens for each expert to achieve a specified capacity, similar to GShard, Switch-Transformer, and DeepSpeed-MoE. Note: Currently unsupported.
+     """
++    # enable dhellam
++    dhellam: bool = False
+ 
+     # model architecture
+     num_layers: int = 0
+diff --git a/megatron/training.py b/megatron/training.py
+index 6402182b..1838b7fe 100644
+--- a/megatron/training.py
++++ b/megatron/training.py
+@@ -51,6 +51,7 @@ from megatron.core.pipeline_parallel import get_forward_backward_func
+ from megatron.utils import report_memory
+ from megatron.model.vision.knn_monitor import compute_feature_bank
+ 
++from dhellam.common.global_variables import GLOBAL_VARIABLES
+ 
+ def print_datetime(string):
+     """Note that this call will sync across all ranks."""
+@@ -214,6 +215,9 @@ def pretrain(train_valid_test_dataset_provider,
+     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
+         model_provider, model_type)
+ 
++    if args.dhellam :
++        GLOBAL_VARIABLES["loss_scale_func"] = optimizer.scale_loss
++
+     timers('model-and-optimizer-setup').stop()
+     print_datetime('after model, optimizer, and learning rate '
+                    'scheduler are built')
+@@ -509,7 +513,6 @@ def setup_model_and_optimizer(model_provider_func,
+     return model, optimizer, opt_param_scheduler
+ 
+ 
+-
+ def train_step(forward_step_func, data_iterator,
+                model, optimizer, opt_param_scheduler, config):
+     """Single training step."""
+@@ -535,6 +538,9 @@ def train_step(forward_step_func, data_iterator,
+         micro_batch_size=args.micro_batch_size,
+         decoder_seq_length=args.decoder_seq_length,
+         forward_only=False)
++    if args.dhellam :
++        losses_reduced = GLOBAL_VARIABLES['loss']
++        GLOBAL_VARIABLES['loss']=[]
+ 
+     # Empty unused memory.
+     if args.empty_unused_memory_level >= 1:
+@@ -569,11 +575,11 @@ def train_step(forward_step_func, data_iterator,
+     if args.empty_unused_memory_level >= 2:
+         torch.cuda.empty_cache()
+ 
+-    if mpu.is_pipeline_last_stage(ignore_virtual=True):
++    if (mpu.is_pipeline_last_stage(ignore_virtual=True) and not args.dhellam) or (mpu.is_pipeline_first_stage(ignore_virtual=True) and args.dhellam):
+         # Average loss across microbatches.
+         loss_reduced = {}
+         for key in losses_reduced[0]:
+-            losses_reduced_for_key = [x[key] for x in losses_reduced]
++            losses_reduced_for_key = [x[key].clone() for x in losses_reduced]
+             loss_reduced[key] = sum(losses_reduced_for_key) / len(losses_reduced_for_key)
+         return loss_reduced, skipped_iter, grad_norm, num_zeros_in_grad
+     return {}, skipped_iter, grad_norm, num_zeros_in_grad
+@@ -633,6 +639,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
+         'backward-send-forward-recv',
+         'backward-send-backward-recv',
+         'forward-backward-send-forward-backward-recv',
++        'pp-bubble',
+         'layernorm-grads-all-reduce',
+         'embedding-grads-all-reduce',
+         'all-grads-sync',
+diff --git a/megatron/utils.py b/megatron/utils.py
+index fe284a37..af9376c6 100644
+--- a/megatron/utils.py
++++ b/megatron/utils.py
+@@ -3,7 +3,7 @@
+ """General utilities."""
+ 
+ import sys
+-
++import os
+ import torch
+ 
+ try:
+@@ -277,10 +277,10 @@ def get_batch_on_this_tp_rank(data_iterator):
+     args = get_args()
+ 
+     def _broadcast(item):
+-       torch.distributed.broadcast(item, mpu.get_tensor_model_parallel_src_rank(), group=mpu.get_tensor_model_parallel_group())
++       if item is not None:
++          torch.distributed.broadcast(item, mpu.get_tensor_model_parallel_src_rank(), group=mpu.get_tensor_model_parallel_group())
+ 
+     if mpu.get_tensor_model_parallel_rank() == 0:
+-
+        if data_iterator is not None:
+            data = next(data_iterator)
+        else:
+@@ -293,6 +293,16 @@ def get_batch_on_this_tp_rank(data_iterator):
+            'attention_mask': data["attention_mask"].cuda(non_blocking = True),
+            'position_ids': data["position_ids"].cuda(non_blocking = True)
+        }
++       if int(os.getenv("NVTE_FUSED_ATTN", "0")) and args.attention_mask_cuda_init:
++           attention_mask = torch.tril(torch.ones((args.seq_length, args.seq_length), device=batch["attention_mask"].device)).unsqueeze(
++              0
++            )
++           attention_mask = attention_mask < 0.5
++           attention_mask = attention_mask.repeat(args.micro_batch_size, 1,1,1)
++           batch["attention_mask"] = attention_mask
++       else:
++           batch["attention_mask"] = None
++
+ 
+        if args.pipeline_model_parallel_size == 1:
+            _broadcast(batch['tokens'])
+@@ -302,10 +312,17 @@ def get_batch_on_this_tp_rank(data_iterator):
+            _broadcast(batch['position_ids'])
+ 
+        elif mpu.is_pipeline_first_stage():
+-           _broadcast(batch['tokens'])
+-           _broadcast(batch['attention_mask'])
+-           _broadcast(batch['position_ids'])
+-
++           if not args.dhellam:
++               _broadcast(batch['tokens'])
++               _broadcast(batch['attention_mask'])
++               _broadcast(batch['position_ids'])
++           else:
++               _broadcast(batch['tokens'])
++               _broadcast(batch['labels'])
++               _broadcast(batch['loss_mask'])
++               _broadcast(batch['attention_mask'])
++               _broadcast(batch['position_ids'])
++               
+        elif mpu.is_pipeline_last_stage():
+            _broadcast(batch['labels'])
+            _broadcast(batch['loss_mask'])
+@@ -316,7 +333,8 @@ def get_batch_on_this_tp_rank(data_iterator):
+        tokens=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.int64 , device = torch.cuda.current_device())
+        labels=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.int64 , device = torch.cuda.current_device())
+        loss_mask=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.float32 , device = torch.cuda.current_device())
+-       attention_mask=torch.empty((args.micro_batch_size,1,args.seq_length,args.seq_length), dtype = torch.bool , device = torch.cuda.current_device())
++       attention_mask=torch.empty((args.micro_batch_size,1,args.seq_length,args.seq_length), dtype = torch.bool , device = torch.cuda.current_device()) if (int(os.getenv("NVTE_FUSED_ATTN", "0")) and args.attention_mask_cuda_init) else None
++    #    attention_mask=torch.empty((args.micro_batch_size,1,args.seq_length,args.seq_length), dtype = torch.bool , device = torch.cuda.current_device())  
+        position_ids=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.int64 , device = torch.cuda.current_device())
+ 
+        if args.pipeline_model_parallel_size == 1:
+@@ -327,12 +345,19 @@ def get_batch_on_this_tp_rank(data_iterator):
+            _broadcast(position_ids)
+  
+        elif mpu.is_pipeline_first_stage():
+-           labels=None
+-           loss_mask=None
++           if not args.dhellam:
++               labels=None
++               loss_mask=None
+    
+-           _broadcast(tokens)
+-           _broadcast(attention_mask)
+-           _broadcast(position_ids)
++               _broadcast(tokens)
++               _broadcast(attention_mask)
++               _broadcast(position_ids)
++           else:
++               _broadcast(tokens)
++               _broadcast(labels)
++               _broadcast(loss_mask)
++               _broadcast(attention_mask)
++               _broadcast(position_ids)         
+ 
+        elif mpu.is_pipeline_last_stage():
+            tokens=None
+diff --git a/pretrain_gpt.py b/pretrain_gpt.py
+index b7d38dab..9eb0912d 100644
+--- a/pretrain_gpt.py
++++ b/pretrain_gpt.py
+@@ -5,6 +5,7 @@ import os
+ import torch
+ from functools import partial
+ from typing import Union
++
+ from megatron import get_args
+ from megatron import print_rank_0
+ from megatron import get_timers
+@@ -25,8 +26,14 @@ from megatron.utils import (
+ )
+ from megatron.arguments import core_transformer_config_from_args
+ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+-
+-
++from dhellam.common.global_variables import GLOBAL_VARIABLES
++from dhellam.core.dsllm import DSLLM
++from dhellam.adaptor.megatron import _add_dhellam_args
++from megatron.core.parallel_state import (
++    get_context_parallel_global_ranks,
++    get_context_parallel_group,
++    get_tensor_model_parallel_group,
++)
+ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.model.GPTModel]:
+     """Builds the model.
+ 
+@@ -44,7 +51,15 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
+ 
+     print_rank_0('building GPT model ...')
+     config = core_transformer_config_from_args(get_args())
+-
++    if args.dhellam:
++        model = DSLLM(config=config, 
++                      vocab_size=args.vocab_size,
++                      max_sequence_length=args.max_position_embeddings, 
++                      tp_group=get_tensor_model_parallel_group(check_initialized=False),
++                      cp_group=get_context_parallel_group(check_initialized=False),
++                      cp_global_ranks=get_context_parallel_global_ranks(check_initialized=False),
++                      pre_process = pre_process)
++        return model
+     if args.use_mcore_models:
+         if args.spec is not None:
+             transformer_layer_spec = import_module(args.spec)
+@@ -54,7 +69,7 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
+         model = GPTModel(
+             config=config,
+             transformer_layer_spec=transformer_layer_spec,
+-            vocab_size=args.padded_vocab_size,
++            vocab_size=args.vocab_size,
+             max_sequence_length=args.max_position_embeddings,
+             pre_process=pre_process,
+             post_process=post_process,
+@@ -82,8 +97,12 @@ def get_batch(data_iterator):
+     """Generate a batch."""
+ 
+     # TODO: this is pretty hacky, find a better way
+-    if (not mpu.is_pipeline_first_stage()) and (not mpu.is_pipeline_last_stage()):
+-        return None, None, None, None, None
++    if not get_args().dhellam:
++        if (not mpu.is_pipeline_first_stage()) and (not mpu.is_pipeline_last_stage()):
++            return None, None, None, None, None
++    else:
++        if (not mpu.is_pipeline_first_stage()):
++            return None, None, None, None, None
+ 
+     # get batches based on the TP rank you are on
+     batch = get_batch_on_this_tp_rank(data_iterator) 
+@@ -137,10 +156,32 @@ def forward_step(data_iterator, model: GPTModel):
+ 
+     # Get the batch.
+     timers('batch-generator', log_level=2).start()
+-    tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
+-        data_iterator)
+-    timers('batch-generator').stop()
++    if data_iterator == 'skip':
++        # if tp rank > 0: data_iterator will be skipped
++        x2 = None
++    else:
++        tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
++            data_iterator)
++        '''
++        if args.attention_mask_cuda_init and attention_mask is not None:
++            attention_mask = torch.tril(torch.ones((args.seq_length, args.seq_length), device=attention_mask.device)).unsqueeze(
++                0
++            )
++            attention_mask = attention_mask < 0.5
++            attention_mask = attention_mask.repeat(args.micro_batch_size, 1,1,1)
++        '''
++        x2 = (tokens, position_ids, attention_mask, labels, loss_mask)
+ 
++    timers('batch-generator').stop()
++    if args.dhellam:
++        if ('inputs' in GLOBAL_VARIABLES) and (GLOBAL_VARIABLES["inputs"][1] is not None) :
++            loss = GLOBAL_VARIABLES['inputs'][1]
++        else:
++            loss = None
++        output_tensor = model(x1=loss,x2=x2)
++        def loss_func_(placeholder):
++            return placeholder, {'lm loss': 1}
++        return output_tensor, loss_func_
+     output_tensor = model(tokens, position_ids, attention_mask,
+                           labels=labels)
+ 
+@@ -200,12 +241,12 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
+ 
+ 
+ if __name__ == "__main__":
+-
+     # Temporary for transition to core datasets
+     train_valid_test_datasets_provider.is_distributed = True
+-
+     pretrain(train_valid_test_datasets_provider,
+              model_provider,
+              ModelType.encoder_or_decoder,
+              forward_step,
++             extra_args_provider=_add_dhellam_args,
+              args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
++    args = get_args()
