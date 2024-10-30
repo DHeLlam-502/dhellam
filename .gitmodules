@@ -1,12 +1,12 @@
-# [submodule "3rdparty/Megatron-LM"]
-# 	path = 3rdparty/Megatron-LM
-# 	url = https://github.com/NVIDIA/Megatron-LM.git
-# [submodule "3rdparty/flash-attention"]
-# 	path = 3rdparty/flash-attention
-# 	url = https://github.com/Dao-AILab/flash-attention.git
 [submodule "3rdparty/Megatron-LM"]
 	path = 3rdparty/Megatron-LM
-	url = https://githubfast.com/NVIDIA/Megatron-LM.git
+	url = https://github.com/NVIDIA/Megatron-LM.git
 [submodule "3rdparty/flash-attention"]
 	path = 3rdparty/flash-attention
-	url = https://githubfast.com/Dao-AILab/flash-attention.git
+	url = https://github.com/Dao-AILab/flash-attention.git
+# [submodule "3rdparty/Megatron-LM"]
+# 	path = 3rdparty/Megatron-LM
+# 	url = https://githubfast.com/NVIDIA/Megatron-LM.git
+# [submodule "3rdparty/flash-attention"]
+# 	path = 3rdparty/flash-attention
+# 	url = https://githubfast.com/Dao-AILab/flash-attention.git
