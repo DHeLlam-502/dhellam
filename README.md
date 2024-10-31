@@ -68,11 +68,12 @@ The Overall directory tree of `DHeLlam` is listed as following:
 In the following steps, we provide a detailed introduction to help you deploy `DHeLlam` atop `Megatron-LM`.
 
 # Prepare dataset
-A light-weight dataset for training Llama locates in `data/`. You can extract it by:
-```
+A light-weight dataset for training Llama locates in `data/`. You can extract it:
+```sh
+cd data/
 tar -zxvf llama-data.tar.gz
 ```
-Then the dataset which can be handled by **Megatron-LM** is collected in `data/llama-data/`.
+Then the dataset is collected in `data/llama-data/`, which can be handled by **Megatron-LM**.
 
 
 # Installation
@@ -85,7 +86,7 @@ Then the dataset which can be handled by **Megatron-LM** is collected in `data/l
 
 We strongly recommand using *docker* to install `DHeLlam` and run examples. You can download available and public docker images in [NGC](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch/tags). In this paper, we evalute `DHeLlam` based on the public docker image with the tag of `nvcr.io/nvidia/pytorch:24.03-py3`. 
 
-To support suppot Flash-Attention, the compute capability of NVIDIA GPU must be larger than 8.0, and you can access the following url to check if your device could satisfy the requirements: [NVIDIA GPU Products](https://developer.nvidia.com/cuda-gpus)
+To support Flash-Attention, the compute capability of NVIDIA GPU must be larger than 8.0, and you can access the following url to check if your device could satisfy the requirements: [NVIDIA GPU Products](https://developer.nvidia.com/cuda-gpus)
 
 ### Clone from github
 ```bash
