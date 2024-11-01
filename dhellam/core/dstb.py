@@ -9,7 +9,6 @@ from dhellam.common.common import print_rank0
 from dhellam import gemm_bwd,pylayernorm_bwd,gather_along_first_dim,pymha_varlen_bwd,_get_qkv_layout,reduce_scatter_along_first_dim
 from dhellam.operators.layernorm_column import dgrad_bwd,wgrad_bwd
 from megatron import get_args
-from cofutils import cofnsys,cofcsv
 from typing import List, Type
 from dhellam.common.global_variables import GLOBAL_VARIABLES
 from dhellam.operators.ring_attn import fa_cp_block_fwd,fa_cp_block_bwd

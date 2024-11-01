@@ -79,14 +79,21 @@ Then the dataset is collected in `data/llama-data/`, which can be handled by **M
 # Installation
 
 ### Requirements
+* apex>=0.1
 * torch>=2.3.0
-* transformer-engine>=1.4.0
-* sentencepiece
 * cuda>=12.4
+
 
 We strongly recommand using *docker* to install `DHeLlam` and run examples. You can download available and public docker images in [NGC](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch/tags). In this paper, we evalute `DHeLlam` based on the public docker image with the tag of `nvcr.io/nvidia/pytorch:24.03-py3`. 
 
 To support Flash-Attention, the compute capability of NVIDIA GPU must be larger than 8.0, and you can access the following url to check if your device could satisfy the requirements: [NVIDIA GPU Products](https://developer.nvidia.com/cuda-gpus)
+
+`apex` is a dependency of `Megatron-LM`, and you can install it by:
+```bash
+git clone https://github.com/NVIDIA/apex
+pip install -v --disable-pip-version-check --no-cache-dir --no-build-isolation --config-settings "--build-option=--cpp_ext" --config-settings "--build-option=--cuda_ext" ./
+```
+If you encounter any problems, you can refer to the [official website](https://github.com/NVIDIA/apex) for more details.
 
 ### Clone from github
 ```bash
@@ -112,15 +119,17 @@ We develop `DHeLlam` atop `Megatron-LM-Corev0.5.0`. All modifications are collec
 ```sh
 cd 3rdparty/Megatron-LM
 git checkout -b dhellam
-git apply ../../megatron.patch
+git apply --whitespace=nowarn ../../megatron.patch
 ```
 
 # Usage: 1-click demo!
 We provide an Llama3.1-70B model with 8 layers as a demo, to quickly present the workflow of `DHeLlam` and you can run it by executing `run.sh` in `script/`. 
+<!-- In this 1-click demo, we use 8 gpus where tp group size is 8 and micro-batch size is 4.  -->
 
 ```sh
 cd script
 bash run.sh
 ```
 
-In the first step, `DHeLlam` searches a nearly optimal strategy for operators pairing through profiling and dynamic programming, which would take nearly 5 minutes. Next, the runtime engine of `DHeLlam` takes the strategy and interleaves the fwd pass and bwd pass from different micro-batches.
+In the first step, `DHeLlam` searches a nearly optimal strategy for operators pairing through profiling and dynamic programming, which would take nearly 5 minutes. Next, the model is partitioned across 8 devices through tensor parallelism and sequence parallelism. If you do not have enough devices or gpu memory budget, please try to modify the related parameters in the script by yourself. Then, the runtime engine of `DHeLlam` takes the strategy and interleaves the fwd pass and bwd pass from different micro-batches. 
+

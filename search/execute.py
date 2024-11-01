@@ -5,7 +5,6 @@ import torch
 import time
 from dhellam.common.common import print_rank0
 from dhellam.core.dstb import DSTB, DCoperation, exec
-from cofutils import cofnsys
 import shutil
 from megatron import get_args
 from megatron.arguments import core_transformer_config_from_args
@@ -123,31 +122,3 @@ if __name__ == "__main__":
         if os.path.exists(dp_file) and max_file == 'dp_best.json':
             print_rank0(f"rename {max_file} to {rename_file}")
             os.rename(dp_file,target_path)
-    if True:
-        with torch.no_grad():
-            args.schedule_config = 'config/best.json'
-            dctb_test = DSTB(config, stream1, stream2).cuda().half()
-            for param in dctb_test.parameters():
-                param.main_grad = torch.zeros_like(param)
-
-            # warmup
-            torch.cuda.synchronize()
-            activation_dict = {}
-            new_activation_dict = {}
-            exec(config,DCoperation,dctb_test.weight_second,None,fwd_input,None,dctb_test.fwd_only_dcblocks,stream1,stream2,{},activation_dict)
-            exec(config,DCoperation,dctb_test.weight_second,dctb_test.weight_first,fwd_input,bwd_input,dctb_test.dcblocks,stream1,stream2,activation_dict,new_activation_dict)
-            activation_dict = new_activation_dict
-            new_activation_dict = {}
-            time_list = []
-            torch.cuda.synchronize()
-            cofnsys.start()
-            for _ in range(times):
-                torch.distributed.barrier(config.tp_group)
-                torch.cuda.synchronize()
-                torch.cuda.nvtx.range_push('transformer-layer')
-                exec(config,DCoperation,dctb_test.weight_second,dctb_test.weight_first,fwd_input,bwd_input,dctb_test.dcblocks,stream1,stream2,activation_dict,new_activation_dict)
-                torch.cuda.nvtx.range_pop()
-                torch.cuda.synchronize()
-                activation_dict = new_activation_dict
-                new_activation_dict = {}
-            cofnsys.stop()

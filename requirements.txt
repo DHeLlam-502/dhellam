@@ -1,0 +1,5 @@
+tqdm
+regex
+pybind11
+sentencepiece
+transformer-engine==1.4.0

@@ -13,7 +13,6 @@ from megatron.core.models.common.embeddings.language_model_embedding import Lang
 from megatron.core import tensor_parallel
 from megatron.utils import average_losses_across_data_parallel_group
 from megatron.core import mpu
-from cofutils import cofnsys
 from dhellam.common.common import print_rank0
 from dhellam.common.template_launch import template_fwd_new, template_bwd_new
 from dhellam.common.global_variables import GLOBAL_VARIABLES

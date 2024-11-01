@@ -1,4 +1,5 @@
 #!/bin/bash
+export NVTE_FRAMEWORK=pytorch
 cd ../search/
 bash search.sh
 cd ../script/

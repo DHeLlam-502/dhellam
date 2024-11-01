@@ -1,5 +1,5 @@
 #!/bin/bash
-
+export NVTE_FRAMEWORK=pytorch
 _GPUS_PER_NODE=8
 _MASTER_ADDR=localhost
 _MASTER_PORT=12345
